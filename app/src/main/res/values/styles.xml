@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.NumberSpotter" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <item name="colorPrimary">#E65C2D</item>
+        <item name="colorPrimaryVariant">#C94B22</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+    </style>
+</resources>
