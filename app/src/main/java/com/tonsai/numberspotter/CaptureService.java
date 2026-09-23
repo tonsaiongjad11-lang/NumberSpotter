@@ -98,8 +98,8 @@ public class CaptureService extends Service {
     private long lastFrameAt = 0L;
     private long nextOcrAt = 0L;
 
-    // Initial 1-25 board map. Index = number, value = cell 0..24.
-    private final int[] initialPos = new int[26];
+    // Number -> cell map. 1-25 is filled from the first board, 26-50 after the reshuffle.
+    private final int[] numberPos = new int[51];
     private int mapCount = 0;
 
     private boolean boardStarted = false;
@@ -117,7 +117,7 @@ public class CaptureService extends Service {
         super.onCreate();
         createChannel();
         recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
-        workerThread = new HandlerThread("NumberSpotterFast");
+        workerThread = new HandlerThread("NumberSpotterFast14");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
         startForegroundCompat(buildNotification("กำลังเตรียม Fast Mode"));
@@ -147,7 +147,7 @@ public class CaptureService extends Service {
     }
 
     private void resetGameState() {
-        Arrays.fill(initialPos, -1);
+        Arrays.fill(numberPos, -1);
         mapCount = 0;
         boardStarted = false;
         target = 1;
@@ -234,8 +234,8 @@ public class CaptureService extends Service {
 
             boolean needOcr =
                     !boardStarted ||
-                    mapCount < 25 ||
-                    (target <= 25 && currentCell < 0);
+                    currentCell < 0 ||
+                    (target <= 25 && mapCount < 25);
 
             if (needOcr && now >= nextOcrAt && ocrBusy.compareAndSet(false, true)) {
                 nextOcrAt = now + OCR_RETRY_MS;
@@ -250,7 +250,8 @@ public class CaptureService extends Service {
             frame.recycle();
         }, worker);
 
-        updateNotification("Fast Mode: รอตารางเกม");
+        if (overlay != null) overlay.showWaiting("จับภาพแล้ว • หาเลข 1…");
+        updateNotification("จับภาพแล้ว • กำลังหาเลข 1");
     }
 
     private Bitmap imageToBitmap(Image image) {
@@ -323,8 +324,9 @@ public class CaptureService extends Service {
                         continue;
                     }
 
-                    // Initial screen contains 1..25. Ignore later values while building the map.
-                    if (value < 1 || value > 25) continue;
+                    int minValue = target <= 25 ? 1 : 26;
+                    int maxValue = target <= 25 ? 25 : 50;
+                    if (value < minValue || value > maxValue) continue;
 
                     Rect box = element.getBoundingBox();
                     if (box == null) continue;
@@ -342,33 +344,35 @@ public class CaptureService extends Service {
 
     private void applyInitialScan(Scan scan, int oneByShape) {
         if (paused) return;
+        int minValue = target <= 25 ? 1 : 26;
+        int maxValue = target <= 25 ? 25 : 50;
+
         for (int cell = 0; cell < 25; cell++) {
             int value = scan.cellValues[cell];
-            if (value >= 1 && value <= 25 && initialPos[value] < 0) {
-                initialPos[value] = cell;
+            if (value >= minValue && value <= maxValue && numberPos[value] < 0) {
+                numberPos[value] = cell;
             }
         }
 
-        // For this font, 1 can be confused with 7. The shape detector is used as the authority for 1.
-        if (oneByShape >= 0) {
-            initialPos[1] = oneByShape;
+        // Only use the shape fallback on the first board.
+        if (target <= 25 && oneByShape >= 0 && numberPos[1] < 0) {
+            numberPos[1] = oneByShape;
         }
 
         recalcMapCount();
-        inferSingleMissingPosition();
 
-        // Start immediately from the first useful board read. No 3-frame waiting.
-        if (!boardStarted && initialPos[1] >= 0 && mapCount >= 8) {
+        // Start the instant we know where 1 is. Do not wait for an arbitrary count of recognized cells.
+        if (!boardStarted && numberPos[1] >= 0) {
             boardStarted = true;
             target = 1;
-            setCurrentCell(initialPos[1], null);
+            setCurrentCell(numberPos[1], null);
             vibrateOnce();
-            updateNotification("Fast Mode: เลข 1");
+            updateNotification("ต่อไป: 1");
             return;
         }
 
         if (!boardStarted) {
-            if (overlay != null) overlay.showWaiting("กำลังอ่านตาราง…");
+            if (overlay != null) overlay.showWaiting("จับภาพแล้ว • หาเลข 1…");
             return;
         }
 
@@ -379,38 +383,10 @@ public class CaptureService extends Service {
 
     private void recalcMapCount() {
         int count = 0;
-        for (int i = 1; i <= 25; i++) if (initialPos[i] >= 0) count++;
+        int from = target <= 25 ? 1 : 26;
+        int to = target <= 25 ? 25 : 50;
+        for (int i = from; i <= to; i++) if (numberPos[i] >= 0) count++;
         mapCount = count;
-    }
-
-    private void inferSingleMissingPosition() {
-        if (mapCount != 24) return;
-
-        int missingValue = -1;
-        boolean[] usedCell = new boolean[25];
-        for (int value = 1; value <= 25; value++) {
-            int cell = initialPos[value];
-            if (cell >= 0 && cell < 25) {
-                usedCell[cell] = true;
-            } else {
-                missingValue = value;
-            }
-        }
-
-        if (missingValue < 1) return;
-
-        int missingCell = -1;
-        for (int cell = 0; cell < 25; cell++) {
-            if (!usedCell[cell]) {
-                missingCell = cell;
-                break;
-            }
-        }
-
-        if (missingCell >= 0) {
-            initialPos[missingValue] = missingCell;
-            recalcMapCount();
-        }
     }
 
     private void handleFastTargetFrame(Bitmap frame, long now) {
@@ -477,6 +453,12 @@ public class CaptureService extends Service {
     private void advanceTarget() {
         target++;
         currentCell = -1;
+
+        if (target == 26) {
+            for (int i = 26; i <= 50; i++) numberPos[i] = -1;
+            mapCount = 0;
+            nextOcrAt = 0L;
+        }
         baselineSignature = null;
         baselineStableFrames = 0;
         changedFrames = 0;
@@ -506,11 +488,8 @@ public class CaptureService extends Service {
     private void resolveCurrentCell() {
         int cell = -1;
 
-        if (target >= 1 && target <= 25) {
-            cell = initialPos[target];
-        } else if (target >= 26 && target <= 50) {
-            // In this game, 26..50 appear in the same cells that previously held 1..25.
-            cell = initialPos[target - 25];
+        if (target >= 1 && target <= 50) {
+            cell = numberPos[target];
         }
 
         if (cell >= 0) {
@@ -522,7 +501,7 @@ public class CaptureService extends Service {
             changedFrames = 0;
             changedCandidateSignature = null;
             changedCandidateStableFrames = 0;
-            if (overlay != null) overlay.showWaiting("กำลังหาเลข " + target);
+            if (overlay != null) overlay.showWaiting("หาเลข " + target + "…");
             nextOcrAt = 0L;
         }
     }
