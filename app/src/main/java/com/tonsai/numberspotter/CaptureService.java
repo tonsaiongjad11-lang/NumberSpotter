@@ -64,9 +64,12 @@ public class CaptureService extends Service {
     // Fast mode: capture at reduced resolution, around 20+ frames/sec.
     private static final int MAX_CAPTURE_WIDTH = 540;
     private static final long FRAME_INTERVAL_MS = 42;
-    private static final long OCR_RETRY_MS = 170;
-    private static final int CHANGE_CONFIRM_FRAMES = 2;
-    private static final float CHANGE_THRESHOLD = 17.0f;
+    private static final long OCR_RETRY_MS = 95;
+    private static final int CHANGE_CONFIRM_FRAMES = 3;
+    private static final int BASELINE_STABLE_FRAMES = 2;
+    private static final long TARGET_ARM_DELAY_MS = 95;
+    private static final float CHANGE_THRESHOLD = 22.0f;
+    private static final float BASELINE_STABLE_THRESHOLD = 8.0f;
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
@@ -96,6 +99,7 @@ public class CaptureService extends Service {
     private int target = 1;
     private int currentCell = -1;
     private int changedFrames = 0;
+    private int baselineStableFrames = 0;
     private int[] baselineSignature = null;
     private long armedAt = 0L;
 
@@ -139,6 +143,7 @@ public class CaptureService extends Service {
         target = 1;
         currentCell = -1;
         changedFrames = 0;
+        baselineStableFrames = 0;
         baselineSignature = null;
         armedAt = 0L;
         nextOcrAt = 0L;
@@ -331,6 +336,7 @@ public class CaptureService extends Service {
         }
 
         recalcMapCount();
+        inferSingleMissingPosition();
 
         // Start immediately from the first useful board read. No 3-frame waiting.
         if (!boardStarted && initialPos[1] >= 0 && mapCount >= 8) {
@@ -358,12 +364,59 @@ public class CaptureService extends Service {
         mapCount = count;
     }
 
+    private void inferSingleMissingPosition() {
+        if (mapCount != 24) return;
+
+        int missingValue = -1;
+        boolean[] usedCell = new boolean[25];
+        for (int value = 1; value <= 25; value++) {
+            int cell = initialPos[value];
+            if (cell >= 0 && cell < 25) {
+                usedCell[cell] = true;
+            } else {
+                missingValue = value;
+            }
+        }
+
+        if (missingValue < 1) return;
+
+        int missingCell = -1;
+        for (int cell = 0; cell < 25; cell++) {
+            if (!usedCell[cell]) {
+                missingCell = cell;
+                break;
+            }
+        }
+
+        if (missingCell >= 0) {
+            initialPos[missingValue] = missingCell;
+            recalcMapCount();
+        }
+    }
+
     private void handleFastTargetFrame(Bitmap frame, long now) {
         int[] sig = cellSignature(frame, currentCell);
         if (sig == null) return;
 
-        if (baselineSignature == null || now < armedAt) {
+        if (now < armedAt) {
+            return;
+        }
+
+        if (baselineSignature == null) {
             baselineSignature = sig;
+            baselineStableFrames = 1;
+            changedFrames = 0;
+            return;
+        }
+
+        if (baselineStableFrames < BASELINE_STABLE_FRAMES) {
+            float settleDiff = signatureDifference(baselineSignature, sig);
+            if (settleDiff <= BASELINE_STABLE_THRESHOLD) {
+                baselineStableFrames++;
+            } else {
+                baselineSignature = sig;
+                baselineStableFrames = 1;
+            }
             changedFrames = 0;
             return;
         }
@@ -376,14 +429,15 @@ public class CaptureService extends Service {
         }
 
         if (changedFrames >= CHANGE_CONFIRM_FRAMES) {
-            advanceTarget(frame);
+            advanceTarget();
         }
     }
 
-    private void advanceTarget(Bitmap currentFrame) {
+    private void advanceTarget() {
         target++;
         currentCell = -1;
         baselineSignature = null;
+        baselineStableFrames = 0;
         changedFrames = 0;
         vibrateOnce();
 
@@ -395,11 +449,11 @@ public class CaptureService extends Service {
 
         resolveCurrentCell();
 
-        // If the next target position is already known, baseline it from this same frame immediately.
-        if (currentCell >= 0) {
-            baselineSignature = cellSignature(currentFrame, currentCell);
-            armedAt = SystemClock.uptimeMillis() + 55;
-        }
+        // Important: do NOT baseline from the previous frame. The marker is drawn first,
+        // then a fresh baseline is collected so the overlay itself cannot trigger a false advance.
+        baselineSignature = null;
+        baselineStableFrames = 0;
+        armedAt = SystemClock.uptimeMillis() + TARGET_ARM_DELAY_MS;
 
         updateNotification("Fast Mode: เลข " + target);
     }
@@ -419,6 +473,7 @@ public class CaptureService extends Service {
         } else {
             currentCell = -1;
             baselineSignature = null;
+            baselineStableFrames = 0;
             changedFrames = 0;
             if (overlay != null) overlay.showWaiting("กำลังหาเลข " + target);
             nextOcrAt = 0L;
@@ -428,8 +483,9 @@ public class CaptureService extends Service {
     private void setCurrentCell(int cell, @Nullable Bitmap frame) {
         currentCell = cell;
         changedFrames = 0;
-        baselineSignature = frame == null ? null : cellSignature(frame, cell);
-        armedAt = SystemClock.uptimeMillis() + 55;
+        baselineStableFrames = 0;
+        baselineSignature = null;
+        armedAt = SystemClock.uptimeMillis() + TARGET_ARM_DELAY_MS;
         if (overlay != null) overlay.showTarget(target, cell);
     }
 
@@ -711,7 +767,7 @@ public class CaptureService extends Service {
             ring.setColor(Color.rgb(255, 88, 40));
 
             fill.setStyle(Paint.Style.FILL);
-            fill.setColor(Color.argb(28, 255, 88, 40));
+            fill.setColor(Color.TRANSPARENT);
 
             labelBg.setColor(Color.argb(210, 25, 25, 25));
             labelText.setColor(Color.WHITE);
@@ -771,7 +827,6 @@ public class CaptureService extends Service {
             float ry = ch * 0.40f;
 
             RectF oval = new RectF(cx - rx, cy - ry, cx + rx, cy + ry);
-            canvas.drawOval(oval, fill);
             canvas.drawOval(oval, ring);
         }
 
