@@ -31,6 +31,8 @@ import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
+import android.widget.Button;
+import android.widget.LinearLayout;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
@@ -70,6 +72,8 @@ public class CaptureService extends Service {
     private static final long TARGET_ARM_DELAY_MS = 95;
     private static final float CHANGE_THRESHOLD = 22.0f;
     private static final float BASELINE_STABLE_THRESHOLD = 8.0f;
+    private static final int CHANGED_STABLE_FRAMES = 3;
+    private static final float CHANGED_STABLE_THRESHOLD = 7.0f;
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
@@ -80,6 +84,8 @@ public class CaptureService extends Service {
 
     private WindowManager windowManager;
     private SpotOverlay overlay;
+    private LinearLayout controlPanel;
+    private volatile boolean paused = false;
 
     private int screenW;
     private int screenH;
@@ -101,6 +107,8 @@ public class CaptureService extends Service {
     private int changedFrames = 0;
     private int baselineStableFrames = 0;
     private int[] baselineSignature = null;
+    private int[] changedCandidateSignature = null;
+    private int changedCandidateStableFrames = 0;
     private long armedAt = 0L;
 
     @Override
@@ -128,6 +136,7 @@ public class CaptureService extends Service {
             int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1);
             Intent data = intent.getParcelableExtra(EXTRA_RESULT_DATA);
             vibrateEnabled = intent.getBooleanExtra(EXTRA_VIBRATE, true);
+            paused = false;
             resetGameState();
 
             if (data != null) beginProjection(resultCode, data);
@@ -145,6 +154,8 @@ public class CaptureService extends Service {
         changedFrames = 0;
         baselineStableFrames = 0;
         baselineSignature = null;
+        changedCandidateSignature = null;
+        changedCandidateStableFrames = 0;
         armedAt = 0L;
         nextOcrAt = 0L;
         if (overlay != null) overlay.showWaiting("รอตาราง…");
@@ -179,6 +190,7 @@ public class CaptureService extends Service {
         captureH = Math.max(1, Math.round(screenH * (captureW / (float) screenW)));
 
         addOverlay();
+        addControlPanel();
 
         imageReader = ImageReader.newInstance(
                 captureW, captureH, PixelFormat.RGBA_8888, 3);
@@ -208,6 +220,11 @@ public class CaptureService extends Service {
             Bitmap frame = imageToBitmap(image);
             image.close();
             if (frame == null) return;
+
+            if (paused) {
+                frame.recycle();
+                return;
+            }
 
             // Once a target is known, advancing uses cheap pixel comparison instead of OCR.
             if (boardStarted && currentCell >= 0) {
@@ -323,6 +340,7 @@ public class CaptureService extends Service {
     }
 
     private void applyInitialScan(Scan scan, int oneByShape) {
+        if (paused) return;
         for (int cell = 0; cell < 25; cell++) {
             int value = scan.cellValues[cell];
             if (value >= 1 && value <= 25 && initialPos[value] < 0) {
@@ -406,6 +424,8 @@ public class CaptureService extends Service {
             baselineSignature = sig;
             baselineStableFrames = 1;
             changedFrames = 0;
+            changedCandidateSignature = null;
+            changedCandidateStableFrames = 0;
             return;
         }
 
@@ -418,17 +438,37 @@ public class CaptureService extends Service {
                 baselineStableFrames = 1;
             }
             changedFrames = 0;
+            changedCandidateSignature = null;
+            changedCandidateStableFrames = 0;
             return;
         }
 
         float diff = signatureDifference(baselineSignature, sig);
         if (diff >= CHANGE_THRESHOLD) {
             changedFrames++;
+
+            if (changedCandidateSignature == null) {
+                changedCandidateSignature = sig;
+                changedCandidateStableFrames = 1;
+            } else {
+                float changedSettle = signatureDifference(changedCandidateSignature, sig);
+                if (changedSettle <= CHANGED_STABLE_THRESHOLD) {
+                    changedCandidateStableFrames++;
+                } else {
+                    changedCandidateSignature = sig;
+                    changedCandidateStableFrames = 1;
+                }
+            }
         } else {
             changedFrames = 0;
+            changedCandidateSignature = null;
+            changedCandidateStableFrames = 0;
         }
 
-        if (changedFrames >= CHANGE_CONFIRM_FRAMES) {
+        // Advance only after the glyph in the target cell changed AND the new glyph
+        // stayed stable for several frames. Short animations/flicker cannot skip a number.
+        if (changedFrames >= CHANGE_CONFIRM_FRAMES &&
+                changedCandidateStableFrames >= CHANGED_STABLE_FRAMES) {
             advanceTarget();
         }
     }
@@ -439,6 +479,8 @@ public class CaptureService extends Service {
         baselineSignature = null;
         baselineStableFrames = 0;
         changedFrames = 0;
+        changedCandidateSignature = null;
+        changedCandidateStableFrames = 0;
         vibrateOnce();
 
         if (target > 50) {
@@ -453,6 +495,8 @@ public class CaptureService extends Service {
         // then a fresh baseline is collected so the overlay itself cannot trigger a false advance.
         baselineSignature = null;
         baselineStableFrames = 0;
+        changedCandidateSignature = null;
+        changedCandidateStableFrames = 0;
         armedAt = SystemClock.uptimeMillis() + TARGET_ARM_DELAY_MS;
 
         updateNotification("Fast Mode: เลข " + target);
@@ -475,6 +519,8 @@ public class CaptureService extends Service {
             baselineSignature = null;
             baselineStableFrames = 0;
             changedFrames = 0;
+            changedCandidateSignature = null;
+            changedCandidateStableFrames = 0;
             if (overlay != null) overlay.showWaiting("กำลังหาเลข " + target);
             nextOcrAt = 0L;
         }
@@ -485,6 +531,8 @@ public class CaptureService extends Service {
         changedFrames = 0;
         baselineStableFrames = 0;
         baselineSignature = null;
+        changedCandidateSignature = null;
+        changedCandidateStableFrames = 0;
         armedAt = SystemClock.uptimeMillis() + TARGET_ARM_DELAY_MS;
         if (overlay != null) overlay.showTarget(target, cell);
     }
@@ -643,6 +691,109 @@ public class CaptureService extends Service {
         overlay.showWaiting("รอตาราง…");
     }
 
+    private void addControlPanel() {
+        if (!Settings.canDrawOverlays(this) || controlPanel != null) return;
+        if (windowManager == null) {
+            windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        }
+
+        controlPanel = new LinearLayout(this);
+        controlPanel.setOrientation(LinearLayout.HORIZONTAL);
+        controlPanel.setGravity(Gravity.CENTER);
+        controlPanel.setPadding(dpInt(4), dpInt(3), dpInt(4), dpInt(3));
+        controlPanel.setBackgroundColor(Color.argb(205, 28, 28, 28));
+
+        Button play = controlButton("▶");
+        Button stop = controlButton("■");
+        Button restart = controlButton("↻");
+        Button close = controlButton("✕");
+
+        play.setContentDescription("เล่นต่อ");
+        stop.setContentDescription("หยุดชั่วคราว");
+        restart.setContentDescription("เริ่มใหม่");
+        close.setContentDescription("ปิดหน้าต่างลอย");
+
+        play.setOnClickListener(v -> worker.post(this::resumeDetection));
+        stop.setOnClickListener(v -> worker.post(this::pauseDetection));
+        restart.setOnClickListener(v -> worker.post(this::restartDetection));
+        close.setOnClickListener(v -> worker.post(this::stopEverything));
+
+        controlPanel.addView(play);
+        controlPanel.addView(stop);
+        controlPanel.addView(restart);
+        controlPanel.addView(close);
+
+        int type = Build.VERSION.SDK_INT >= 26
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+        );
+        lp.gravity = Gravity.TOP | Gravity.END;
+        lp.x = dpInt(8);
+        lp.y = dpInt(135);
+        windowManager.addView(controlPanel, lp);
+    }
+
+    private Button controlButton(String text) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextSize(17);
+        b.setAllCaps(false);
+        b.setMinWidth(dpInt(46));
+        b.setMinimumWidth(dpInt(46));
+        b.setMinHeight(dpInt(44));
+        b.setMinimumHeight(dpInt(44));
+        b.setPadding(dpInt(5), 0, dpInt(5), 0);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                dpInt(48), dpInt(46));
+        lp.setMargins(dpInt(2), 0, dpInt(2), 0);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private void pauseDetection() {
+        paused = true;
+        changedFrames = 0;
+        changedCandidateSignature = null;
+        changedCandidateStableFrames = 0;
+        if (overlay != null) overlay.showPaused(target, currentCell);
+        updateNotification("หยุดชั่วคราว — เลข " + target);
+    }
+
+    private void resumeDetection() {
+        paused = false;
+        changedFrames = 0;
+        baselineStableFrames = 0;
+        baselineSignature = null;
+        changedCandidateSignature = null;
+        changedCandidateStableFrames = 0;
+        armedAt = SystemClock.uptimeMillis() + TARGET_ARM_DELAY_MS;
+
+        if (overlay != null) {
+            if (currentCell >= 0) overlay.showTarget(target, currentCell);
+            else overlay.showWaiting("กำลังหาเลข " + target);
+        }
+        updateNotification("เล่นต่อ — เลข " + target);
+    }
+
+    private void restartDetection() {
+        paused = false;
+        resetGameState();
+        if (overlay != null) overlay.showWaiting("เริ่มใหม่ — กำลังหาเลข 1");
+        updateNotification("เริ่มใหม่ — รอตาราง");
+    }
+
+    private int dpInt(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
     private void vibrateOnce() {
         if (!vibrateEnabled) return;
         Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
@@ -682,6 +833,12 @@ public class CaptureService extends Service {
             try { windowManager.removeView(overlay); } catch (Throwable ignored) {}
         }
         overlay = null;
+
+        if (windowManager != null && controlPanel != null) {
+            try { windowManager.removeView(controlPanel); } catch (Throwable ignored) {}
+        }
+        controlPanel = null;
+
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
     }
@@ -694,6 +851,11 @@ public class CaptureService extends Service {
             try { windowManager.removeView(overlay); } catch (Throwable ignored) {}
         }
         overlay = null;
+
+        if (windowManager != null && controlPanel != null) {
+            try { windowManager.removeView(controlPanel); } catch (Throwable ignored) {}
+        }
+        controlPanel = null;
 
         if (recognizer != null) recognizer.close();
         if (workerThread != null) workerThread.quitSafely();
@@ -789,6 +951,15 @@ public class CaptureService extends Service {
                 targetCell = -1;
                 finished = false;
                 message = msg;
+                invalidate();
+            });
+        }
+
+        void showPaused(int number, int cell) {
+            post(() -> {
+                finished = false;
+                targetCell = cell;
+                message = "หยุด • เลข " + number;
                 invalidate();
             });
         }
