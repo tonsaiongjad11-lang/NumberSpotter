@@ -36,8 +36,16 @@ import android.widget.LinearLayout;
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
+import com.google.android.gms.tasks.Task;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class CaptureService extends Service {
     public static final String ACTION_START = "com.tonsai.numberspotter.START";
@@ -107,7 +115,10 @@ public class CaptureService extends Service {
     };
 
     private final byte[][] templates = new byte[26][];
-    private final int[] positions = new int[26];
+    private final int[] positions = new int[51];
+    private TextRecognizer recognizer;
+    private final AtomicBoolean secondBoardOcrBusy = new AtomicBoolean(false);
+    private boolean secondBoardMapped = false;
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
@@ -142,6 +153,7 @@ public class CaptureService extends Service {
         super.onCreate();
         Arrays.fill(positions, -1);
         decodeTemplates();
+        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
         createChannel();
 
         workerThread = new HandlerThread("NumberSpotterTemplateFast");
@@ -193,6 +205,8 @@ public class CaptureService extends Service {
 
     private void resetGame() {
         Arrays.fill(positions, -1);
+        secondBoardMapped = false;
+        secondBoardOcrBusy.set(false);
         target = 1;
         currentCell = -1;
         clearTapState();
@@ -304,12 +318,12 @@ public class CaptureService extends Service {
             if (target <= 25) {
                 locateTarget(frame, target, now);
             } else {
-                int source = target - 25;
-                int cell = positions[source];
+                int cell = positions[target];
                 if (cell >= 0) {
                     lockTarget(cell, now);
                 } else {
-                    if (overlay != null) overlay.showWaiting("หาเลข " + target + "…");
+                    if (overlay != null) overlay.showWaiting("อ่านชุด 26–50…");
+                    requestSecondBoardMap(frame);
                 }
             }
             return;
@@ -423,10 +437,127 @@ public class CaptureService extends Service {
         if (target <= 25) {
             locateTarget(frame, target, now);
         } else {
-            int cell = positions[target - 25];
-            if (cell >= 0) lockTarget(cell, now);
-            else if (overlay != null) overlay.showWaiting("หาเลข " + target + "…");
+            int cell = positions[target];
+            if (cell >= 0) {
+                lockTarget(cell, now);
+            } else {
+                if (overlay != null) overlay.showWaiting("อ่านชุด 26–50…");
+                requestSecondBoardMap(frame);
+            }
         }
+    }
+
+    // The game reshuffles after 25, so scan the new 26–50 board once.
+    // This is not continuous OCR: it runs only at the board transition, then all following
+    // targets use the cached positions and fast pixel-change tracking.
+    private void requestSecondBoardMap(Bitmap frame) {
+        if (secondBoardMapped || !secondBoardOcrBusy.compareAndSet(false, true)) return;
+
+        Bitmap copy = frame.copy(Bitmap.Config.ARGB_8888, false);
+        InputImage input = InputImage.fromBitmap(copy, 0);
+        Task<Text> task = recognizer.process(input);
+
+        task.addOnSuccessListener(result -> worker.post(() -> {
+            try {
+                int found = mapSecondBoard(result, copy.getWidth(), copy.getHeight());
+                if (found >= 18) {
+                    secondBoardMapped = true;
+                    int cell = positions[target];
+                    if (cell >= 0) {
+                        lockTarget(cell, SystemClock.uptimeMillis());
+                    }
+                }
+            } finally {
+                copy.recycle();
+                secondBoardOcrBusy.set(false);
+            }
+        })).addOnFailureListener(e -> worker.post(() -> {
+            copy.recycle();
+            secondBoardOcrBusy.set(false);
+        }));
+    }
+
+    private int mapSecondBoard(Text text, int width, int height) {
+        boolean[] seen = new boolean[51];
+        int found = 0;
+
+        for (Text.TextBlock block : text.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                for (Text.Element element : line.getElements()) {
+                    String raw = element.getText().trim();
+                    if (!raw.matches("\\d{2}")) continue;
+
+                    int value;
+                    try {
+                        value = Integer.parseInt(raw);
+                    } catch (NumberFormatException ex) {
+                        continue;
+                    }
+
+                    if (value < 26 || value > 50) continue;
+                    android.graphics.Rect box = element.getBoundingBox();
+                    if (box == null) continue;
+
+                    int cell = nearestCell(
+                            box.exactCenterX() / width,
+                            box.exactCenterY() / height
+                    );
+                    if (cell < 0) continue;
+
+                    if (!seen[value]) {
+                        positions[value] = cell;
+                        seen[value] = true;
+                        found++;
+                    }
+                }
+            }
+        }
+
+        if (found == 24) {
+            int missingValue = -1;
+            boolean[] used = new boolean[25];
+
+            for (int value = 26; value <= 50; value++) {
+                int cell = positions[value];
+                if (cell >= 0) used[cell] = true;
+                else missingValue = value;
+            }
+
+            if (missingValue >= 0) {
+                for (int cell = 0; cell < 25; cell++) {
+                    if (!used[cell]) {
+                        positions[missingValue] = cell;
+                        found++;
+                        break;
+                    }
+                }
+            }
+        }
+
+        return found;
+    }
+
+    private int nearestCell(float nx, float ny) {
+        int best = -1;
+        float bestD = Float.MAX_VALUE;
+
+        for (int cell = 0; cell < 25; cell++) {
+            int col = cell % 5;
+            int row = cell / 5;
+            float cx = GRID_X0 + col * GRID_DX;
+            float cy = GRID_Y0 + row * GRID_DY;
+
+            float dx = (nx - cx) / GRID_DX;
+            float dy = (ny - cy) / GRID_DY;
+            float d = dx * dx + dy * dy;
+
+            if (d < bestD) {
+                bestD = d;
+                best = cell;
+            }
+        }
+
+        return bestD <= 0.45f ? best : -1;
     }
 
     private void clearTapState() {
@@ -719,6 +850,7 @@ public class CaptureService extends Service {
         }
         controlPanel = null;
 
+        if (recognizer != null) recognizer.close();
         if (workerThread != null) workerThread.quitSafely();
         super.onDestroy();
     }
