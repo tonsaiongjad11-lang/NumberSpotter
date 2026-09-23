@@ -66,7 +66,7 @@ public class CaptureService extends Service {
     // Fast mode: capture at reduced resolution, around 20+ frames/sec.
     private static final int MAX_CAPTURE_WIDTH = 540;
     private static final long FRAME_INTERVAL_MS = 42;
-    private static final long OCR_RETRY_MS = 95;
+    private static final long OCR_RETRY_MS = 70;
     private static final int CHANGE_CONFIRM_FRAMES = 2;
     private static final int BASELINE_STABLE_FRAMES = 2;
     private static final long TARGET_ARM_DELAY_MS = 45;
@@ -98,6 +98,8 @@ public class CaptureService extends Service {
     private final AtomicBoolean ocrBusy = new AtomicBoolean(false);
     private long lastFrameAt = 0L;
     private long nextOcrAt = 0L;
+    private int ocrCandidateCell = -1;
+    private int ocrCandidateVotes = 0;
 
     // Initial 1-25 board map. Index = number, value = cell 0..24.
     private final int[] initialPos = new int[26];
@@ -118,7 +120,7 @@ public class CaptureService extends Service {
         super.onCreate();
         createChannel();
         recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
-        workerThread = new HandlerThread("NumberSpotterFast15");
+        workerThread = new HandlerThread("NumberSpotterFast17");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
         startForegroundCompat(buildNotification("กำลังเตรียม Fast Mode"));
@@ -160,6 +162,8 @@ public class CaptureService extends Service {
         changedCandidateStableFrames = 0;
         armedAt = 0L;
         nextOcrAt = 0L;
+        ocrCandidateCell = -1;
+        ocrCandidateVotes = 0;
         if (overlay != null) overlay.showWaiting("รอตาราง…");
     }
 
@@ -235,8 +239,7 @@ public class CaptureService extends Service {
 
             boolean needOcr =
                     !boardStarted ||
-                    mapCount < 25 ||
-                    (target <= 25 && currentCell < 0);
+                    currentCell < 0;
 
             if (needOcr && now >= nextOcrAt && ocrBusy.compareAndSet(false, true)) {
                 nextOcrAt = now + OCR_RETRY_MS;
@@ -325,8 +328,7 @@ public class CaptureService extends Service {
                         continue;
                     }
 
-                    // Initial screen contains 1..25. Ignore later values while building the map.
-                    if (value < 1 || value > 25) continue;
+                    if (value < 1 || value > 50) continue;
 
                     Rect box = element.getBoundingBox();
                     if (box == null) continue;
@@ -344,38 +346,46 @@ public class CaptureService extends Service {
 
     private void applyInitialScan(Scan scan, int oneByShape) {
         if (paused) return;
+
+        int foundCell = -1;
         for (int cell = 0; cell < 25; cell++) {
-            int value = scan.cellValues[cell];
-            if (value >= 1 && value <= 25 && initialPos[value] < 0) {
-                initialPos[value] = cell;
+            if (scan.cellValues[cell] == target) {
+                foundCell = cell;
+                break;
             }
         }
 
-        // For this font, 1 can be confused with 7. The shape detector is used as the authority for 1.
-        if (oneByShape >= 0) {
-            initialPos[1] = oneByShape;
+        // Special fallback only for the first target, because this font can make 1 look like 7.
+        if (target == 1 && foundCell < 0 && oneByShape >= 0) {
+            foundCell = oneByShape;
         }
 
-        recalcMapCount();
-        inferSingleMissingPosition();
+        if (foundCell >= 0) {
+            if (foundCell == ocrCandidateCell) {
+                ocrCandidateVotes++;
+            } else {
+                ocrCandidateCell = foundCell;
+                ocrCandidateVotes = 1;
+            }
 
-        // Start immediately from the first useful board read. No 3-frame waiting.
-        if (!boardStarted && initialPos[1] >= 0) {
-            boardStarted = true;
-            target = 1;
-            setCurrentCell(initialPos[1], null);
-            vibrateOnce();
-            updateNotification("Fast Mode: เลข 1");
-            return;
-        }
-
-        if (!boardStarted) {
-            if (overlay != null) overlay.showWaiting("หาเลข 1…");
-            return;
-        }
-
-        if (currentCell < 0) {
-            resolveCurrentCell();
+            // Never trust one stray OCR frame. Two matching reads are still very fast,
+            // but stop jumps like 1 -> the cell containing 24.
+            if (ocrCandidateVotes >= 2) {
+                boardStarted = true;
+                setCurrentCell(foundCell, null);
+                ocrCandidateCell = -1;
+                ocrCandidateVotes = 0;
+                updateNotification("ต่อไป: " + target);
+            } else if (overlay != null) {
+                overlay.showSearching(target);
+            }
+        } else {
+            ocrCandidateCell = -1;
+            ocrCandidateVotes = 0;
+            if (overlay != null) {
+                if (!boardStarted) overlay.showWaiting("หาเลข 1…");
+                else overlay.showSearching(target);
+            }
         }
     }
 
@@ -477,13 +487,20 @@ public class CaptureService extends Service {
     }
 
     private void advanceTarget() {
+        // Sequential state is authoritative: one successful game change = exactly +1.
         target++;
         currentCell = -1;
+
         baselineSignature = null;
         baselineStableFrames = 0;
         changedFrames = 0;
         changedCandidateSignature = null;
         changedCandidateStableFrames = 0;
+
+        ocrCandidateCell = -1;
+        ocrCandidateVotes = 0;
+        nextOcrAt = 0L;
+
         vibrateOnce();
 
         if (target > 50) {
@@ -492,41 +509,18 @@ public class CaptureService extends Service {
             return;
         }
 
-        resolveCurrentCell();
-
-        // Important: do NOT baseline from the previous frame. The marker is drawn first,
-        // then a fresh baseline is collected so the overlay itself cannot trigger a false advance.
-        baselineSignature = null;
-        baselineStableFrames = 0;
-        changedCandidateSignature = null;
-        changedCandidateStableFrames = 0;
-        armedAt = SystemClock.uptimeMillis() + TARGET_ARM_DELAY_MS;
-
-        updateNotification("Fast Mode: เลข " + target);
+        // Keep the previous ring visible for the few milliseconds needed to OCR the exact
+        // next target. As soon as target N is confirmed, the ring moves there.
+        if (overlay != null) overlay.showSearching(target);
+        updateNotification("กำลังหาเลข " + target);
     }
 
     private void resolveCurrentCell() {
-        int cell = -1;
-
-        if (target >= 1 && target <= 25) {
-            cell = initialPos[target];
-        } else if (target >= 26 && target <= 50) {
-            // In this game, 26..50 appear in the same cells that previously held 1..25.
-            cell = initialPos[target - 25];
-        }
-
-        if (cell >= 0) {
-            setCurrentCell(cell, null);
-        } else {
-            currentCell = -1;
-            baselineSignature = null;
-            baselineStableFrames = 0;
-            changedFrames = 0;
-            changedCandidateSignature = null;
-            changedCandidateStableFrames = 0;
-            if (overlay != null) overlay.showWaiting("หาเลข " + target);
-            nextOcrAt = 0L;
-        }
+        currentCell = -1;
+        ocrCandidateCell = -1;
+        ocrCandidateVotes = 0;
+        nextOcrAt = 0L;
+        if (overlay != null) overlay.showSearching(target);
     }
 
     private void setCurrentCell(int cell, @Nullable Bitmap frame) {
@@ -751,7 +745,7 @@ public class CaptureService extends Service {
         );
         lp.gravity = Gravity.TOP | Gravity.END;
         lp.x = dpInt(8);
-        lp.y = dpInt(135);
+        lp.y = dpInt(34);
         windowManager.addView(controlPanel, lp);
     }
 
@@ -965,6 +959,16 @@ public class CaptureService extends Service {
                 targetCell = -1;
                 finished = false;
                 message = msg;
+                invalidate();
+            });
+        }
+
+        void showSearching(int number) {
+            post(() -> {
+                finished = false;
+                // Intentionally keep targetCell unchanged until the exact next number
+                // is confirmed, so the ring never simply disappears between taps.
+                message = "หาเลข " + number + "…";
                 invalidate();
             });
         }
