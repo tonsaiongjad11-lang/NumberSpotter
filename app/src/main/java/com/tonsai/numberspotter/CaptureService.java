@@ -69,12 +69,13 @@ public class CaptureService extends Service {
     private static final long OCR_RETRY_MS = 95;
     private static final int CHANGE_CONFIRM_FRAMES = 2;
     private static final int BASELINE_STABLE_FRAMES = 2;
-    private static final long TARGET_ARM_DELAY_MS = 70;
-    // signatureDifference() returns percentage of meaningfully changed samples (0..100).
-    private static final float CHANGE_THRESHOLD = 7.0f;
-    private static final float BASELINE_STABLE_THRESHOLD = 2.5f;
+    private static final long TARGET_ARM_DELAY_MS = 45;
+    // We watch the game's own "เลขต่อไป" display, not the circle/tile itself.
+    // That display only changes after a successful tap, so it is a much cleaner signal.
+    private static final float CHANGE_THRESHOLD = 3.0f;
+    private static final float BASELINE_STABLE_THRESHOLD = 1.2f;
     private static final int CHANGED_STABLE_FRAMES = 2;
-    private static final float CHANGED_STABLE_THRESHOLD = 3.5f;
+    private static final float CHANGED_STABLE_THRESHOLD = 1.8f;
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
@@ -117,7 +118,7 @@ public class CaptureService extends Service {
         super.onCreate();
         createChannel();
         recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
-        workerThread = new HandlerThread("NumberSpotterFast");
+        workerThread = new HandlerThread("NumberSpotterFast15");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
         startForegroundCompat(buildNotification("กำลังเตรียม Fast Mode"));
@@ -250,7 +251,8 @@ public class CaptureService extends Service {
             frame.recycle();
         }, worker);
 
-        updateNotification("Fast Mode: รอตารางเกม");
+        if (overlay != null) overlay.showWaiting("จับภาพแล้ว • หาเลข 1…");
+        updateNotification("จับภาพแล้ว • หาเลข 1");
     }
 
     private Bitmap imageToBitmap(Image image) {
@@ -358,7 +360,7 @@ public class CaptureService extends Service {
         inferSingleMissingPosition();
 
         // Start immediately from the first useful board read. No 3-frame waiting.
-        if (!boardStarted && initialPos[1] >= 0 && mapCount >= 8) {
+        if (!boardStarted && initialPos[1] >= 0) {
             boardStarted = true;
             target = 1;
             setCurrentCell(initialPos[1], null);
@@ -368,7 +370,7 @@ public class CaptureService extends Service {
         }
 
         if (!boardStarted) {
-            if (overlay != null) overlay.showWaiting("กำลังอ่านตาราง…");
+            if (overlay != null) overlay.showWaiting("หาเลข 1…");
             return;
         }
 
@@ -414,7 +416,7 @@ public class CaptureService extends Service {
     }
 
     private void handleFastTargetFrame(Bitmap frame, long now) {
-        int[] sig = cellSignature(frame, currentCell);
+        int[] sig = headerSignature(frame);
         if (sig == null) return;
 
         if (now < armedAt) {
@@ -522,7 +524,7 @@ public class CaptureService extends Service {
             changedFrames = 0;
             changedCandidateSignature = null;
             changedCandidateStableFrames = 0;
-            if (overlay != null) overlay.showWaiting("กำลังหาเลข " + target);
+            if (overlay != null) overlay.showWaiting("หาเลข " + target);
             nextOcrAt = 0L;
         }
     }
@@ -538,45 +540,41 @@ public class CaptureService extends Service {
         if (overlay != null) overlay.showTarget(target, cell);
     }
 
-    private int[] cellSignature(Bitmap frame, int cell) {
-        if (cell < 0 || cell >= 25) return null;
+    private int[] headerSignature(Bitmap frame) {
+        // Region containing the large orange "เลขต่อไป" number in the supplied game layout.
+        // Keeping this region small makes the change detector very fast and unaffected by
+        // the board highlight overlay.
+        final float LEFT = 0.64f;
+        final float RIGHT = 0.87f;
+        final float TOP = 0.195f;
+        final float BOTTOM = 0.275f;
 
-        RectF b = boardRect(frame.getWidth(), frame.getHeight());
-        float cw = b.width() / 5f;
-        float ch = b.height() / 5f;
-        int col = cell % 5;
-        int row = cell / 5;
-
-        float left = b.left + col * cw;
-        float top = b.top + row * ch;
-
-        // Dense sampling over the glyph area. The old 8x10 grid missed too much of thin digits
-        // such as 1 and sometimes never noticed that a clicked tile had changed.
-        int cols = 18;
-        int rows = 22;
+        int cols = 30;
+        int rows = 24;
         int[] out = new int[cols * rows];
         int k = 0;
 
+        int x0 = clamp(Math.round(frame.getWidth() * LEFT), 0, frame.getWidth() - 1);
+        int x1 = clamp(Math.round(frame.getWidth() * RIGHT), x0 + 1, frame.getWidth());
+        int y0 = clamp(Math.round(frame.getHeight() * TOP), 0, frame.getHeight() - 1);
+        int y1 = clamp(Math.round(frame.getHeight() * BOTTOM), y0 + 1, frame.getHeight());
+
         for (int yy = 0; yy < rows; yy++) {
-            float fy = (yy + 0.5f) / rows;
-            int y = clamp(
-                    Math.round(top + ch * (0.16f + fy * 0.68f)),
-                    0,
-                    frame.getHeight() - 1
-            );
+            int y = y0 + Math.min(y1 - y0 - 1,
+                    (int) ((yy + 0.5f) * (y1 - y0) / rows));
 
             for (int xx = 0; xx < cols; xx++) {
-                float fx = (xx + 0.5f) / cols;
-                int x = clamp(
-                        Math.round(left + cw * (0.14f + fx * 0.72f)),
-                        0,
-                        frame.getWidth() - 1
-                );
+                int x = x0 + Math.min(x1 - x0 - 1,
+                        (int) ((xx + 0.5f) * (x1 - x0) / cols));
 
                 int color = frame.getPixel(x, y);
-                out[k++] = (Color.red(color) * 30
-                        + Color.green(color) * 59
-                        + Color.blue(color) * 11) / 100;
+                int r = Color.red(color);
+                int g = Color.green(color);
+                int b = Color.blue(color);
+
+                // Emphasize the orange/red target number and suppress the pale card background.
+                int orangeScore = Math.max(0, r - (g + b) / 2);
+                out[k++] = orangeScore;
             }
         }
 
@@ -586,20 +584,12 @@ public class CaptureService extends Service {
     private float signatureDifference(int[] a, int[] b) {
         if (a == null || b == null || a.length != b.length) return 100f;
 
-        int meaningfulChanges = 0;
+        int changed = 0;
         for (int i = 0; i < a.length; i++) {
-            int ga = a[i];
-            int gb = b[i];
-            boolean darkA = ga < 145;
-            boolean darkB = gb < 145;
-
-            // Count either a foreground/background transition or a strong luminance change.
-            if (darkA != darkB || Math.abs(ga - gb) >= 38) {
-                meaningfulChanges++;
-            }
+            // A target-number glyph change causes a strong orange-score change.
+            if (Math.abs(a[i] - b[i]) >= 28) changed++;
         }
-
-        return meaningfulChanges * 100f / a.length;
+        return changed * 100f / a.length;
     }
 
     // Fallback for the handwritten-looking "1": narrow vertical mark and no wide top bar.
@@ -802,7 +792,7 @@ public class CaptureService extends Service {
 
         if (overlay != null) {
             if (currentCell >= 0) overlay.showTarget(target, currentCell);
-            else overlay.showWaiting("กำลังหาเลข " + target);
+            else overlay.showWaiting("หาเลข " + target);
         }
         updateNotification("เล่นต่อ — เลข " + target);
     }
