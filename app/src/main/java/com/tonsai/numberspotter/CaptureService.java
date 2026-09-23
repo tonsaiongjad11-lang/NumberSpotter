@@ -67,13 +67,14 @@ public class CaptureService extends Service {
     private static final int MAX_CAPTURE_WIDTH = 540;
     private static final long FRAME_INTERVAL_MS = 42;
     private static final long OCR_RETRY_MS = 95;
-    private static final int CHANGE_CONFIRM_FRAMES = 3;
+    private static final int CHANGE_CONFIRM_FRAMES = 2;
     private static final int BASELINE_STABLE_FRAMES = 2;
-    private static final long TARGET_ARM_DELAY_MS = 95;
-    private static final float CHANGE_THRESHOLD = 22.0f;
-    private static final float BASELINE_STABLE_THRESHOLD = 8.0f;
-    private static final int CHANGED_STABLE_FRAMES = 3;
-    private static final float CHANGED_STABLE_THRESHOLD = 7.0f;
+    private static final long TARGET_ARM_DELAY_MS = 70;
+    // signatureDifference() returns percentage of meaningfully changed samples (0..100).
+    private static final float CHANGE_THRESHOLD = 7.0f;
+    private static final float BASELINE_STABLE_THRESHOLD = 2.5f;
+    private static final int CHANGED_STABLE_FRAMES = 2;
+    private static final float CHANGED_STABLE_THRESHOLD = 3.5f;
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
@@ -549,22 +550,33 @@ public class CaptureService extends Service {
         float left = b.left + col * cw;
         float top = b.top + row * ch;
 
-        // Sample the center of the cell, where the number is. 8x10 = 80 samples.
-        int cols = 8;
-        int rows = 10;
+        // Dense sampling over the glyph area. The old 8x10 grid missed too much of thin digits
+        // such as 1 and sometimes never noticed that a clicked tile had changed.
+        int cols = 18;
+        int rows = 22;
         int[] out = new int[cols * rows];
         int k = 0;
 
         for (int yy = 0; yy < rows; yy++) {
             float fy = (yy + 0.5f) / rows;
-            int y = clamp(Math.round(top + ch * (0.22f + fy * 0.56f)), 0, frame.getHeight() - 1);
+            int y = clamp(
+                    Math.round(top + ch * (0.16f + fy * 0.68f)),
+                    0,
+                    frame.getHeight() - 1
+            );
 
             for (int xx = 0; xx < cols; xx++) {
                 float fx = (xx + 0.5f) / cols;
-                int x = clamp(Math.round(left + cw * (0.20f + fx * 0.60f)), 0, frame.getWidth() - 1);
+                int x = clamp(
+                        Math.round(left + cw * (0.14f + fx * 0.72f)),
+                        0,
+                        frame.getWidth() - 1
+                );
 
-                int c = frame.getPixel(x, y);
-                out[k++] = (Color.red(c) * 30 + Color.green(c) * 59 + Color.blue(c) * 11) / 100;
+                int color = frame.getPixel(x, y);
+                out[k++] = (Color.red(color) * 30
+                        + Color.green(color) * 59
+                        + Color.blue(color) * 11) / 100;
             }
         }
 
@@ -573,9 +585,21 @@ public class CaptureService extends Service {
 
     private float signatureDifference(int[] a, int[] b) {
         if (a == null || b == null || a.length != b.length) return 100f;
-        long total = 0;
-        for (int i = 0; i < a.length; i++) total += Math.abs(a[i] - b[i]);
-        return total / (float) a.length;
+
+        int meaningfulChanges = 0;
+        for (int i = 0; i < a.length; i++) {
+            int ga = a[i];
+            int gb = b[i];
+            boolean darkA = ga < 145;
+            boolean darkB = gb < 145;
+
+            // Count either a foreground/background transition or a strong luminance change.
+            if (darkA != darkB || Math.abs(ga - gb) >= 38) {
+                meaningfulChanges++;
+            }
+        }
+
+        return meaningfulChanges * 100f / a.length;
     }
 
     // Fallback for the handwritten-looking "1": narrow vertical mark and no wide top bar.
