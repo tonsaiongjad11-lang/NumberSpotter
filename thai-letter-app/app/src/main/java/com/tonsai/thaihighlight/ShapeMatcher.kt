@@ -16,14 +16,14 @@ import kotlin.math.roundToInt
  * No ordering guess, saved locations, or automatic touch input.
  */
 class ShapeMatcher {
-    private companion object { const val SIZE = 40 }
+    private companion object { const val SIZE = 64 }
 
     data class Result(
         val row: Int, val col: Int, val rect: Rect,
         val score: Float, val secondScore: Float
     )
     data class Reading(val match: Result?, val message: String)
-    private data class Glyph(val bits: BooleanArray, val count: Int, val aspect: Float)
+    private data class Glyph(val bits: BooleanArray, val count: Int, val aspect: Float, val holes: BooleanArray)
     private data class Component(val pixels: IntArray, val length: Int, val area: Int,
                                  val left: Int, val top: Int, val right: Int, val bottom: Int)
 
@@ -50,23 +50,33 @@ class ShapeMatcher {
         for (row in sorted.chunked(5)) {
             if (row.maxOf { it.centerY() }-row.minOf { it.centerY() } > h*0.02f) return emptyList()
         }
-        return sorted
+        // The green overlay can shrink one detected card. Use the median dimensions.
+        val mw = sorted.map { it.width() }.sorted()[sorted.size/2]
+        val mh = sorted.map { it.height() }.sorted()[sorted.size/2]
+        return sorted.map { Rect(it.centerX()-mw/2,it.centerY()-mh/2,
+            it.centerX()+(mw+1)/2,it.centerY()+(mh+1)/2) }
     }
 
     fun scan(bitmap: Bitmap, actualWidth: Int, actualHeight: Int, config: RegionConfig): Reading {
         val board = config.board.toPixels(actualWidth, actualHeight)
         val now = System.nanoTime()/1000000L
         if (now-detectionAt > 400L) {
-            detectedCells = locateCards(bitmap)
+            val detection = Bitmap.createScaledBitmap(bitmap, 400, (bitmap.height*400f/bitmap.width).toInt(), true)
+            val factor = bitmap.width/400f
+            detectedCells = try { locateCards(detection).map {
+                Rect((it.left*factor).roundToInt(), (it.top*factor).roundToInt(),
+                    (it.right*factor).roundToInt(), (it.bottom*factor).roundToInt())
+            } } finally { if (detection !== bitmap) detection.recycle() }
             detectionAt = now
         }
         val cells = detectedCells.ifEmpty { (0 until 20).map { cellRect(board,it/5,it%5) } }
         val first = detectedCells.firstOrNull()
+        val rowTop = detectedCells.take(5).map { it.top }.sorted().let { if (it.isEmpty()) 0 else it[it.size/2] }
         val cueRect = if (first != null) Rect(
             (actualWidth*0.53f).toInt(),
-            (first.top-first.height()*0.70f).toInt().coerceAtLeast(0),
+            (rowTop-first.height()*0.86f).toInt().coerceAtLeast(0),
             (actualWidth*0.95f).toInt(),
-            (first.top-first.height()*0.16f).toInt().coerceAtLeast(1)
+            (rowTop-first.height()*0.02f).toInt().coerceAtLeast(1)
         ) else config.cue.toPixels(actualWidth, actualHeight)
         if (board.width() < 30 || board.height() < 30) return Reading(null, "กรอบตารางเล็กเกินไป")
         val cue = extract(bitmap, cueRect, preferOrange = false)
@@ -97,7 +107,7 @@ class ShapeMatcher {
         }
         if (bestRect == null) return Reading(null, "ไม่พบรูปทรงอักษรใน ช่องตาราง: ตรวจกรอบตาราง")
         val confidenceOk = bestScore >= config.cutoff
-        val separationOk = bestScore - nextScore >= config.minGap
+        val separationOk = bestScore - nextScore >= if (bestScore >= 0.86f) 0.014f else config.minGap
         if (!confidenceOk || !separationOk) {
             return Reading(null, "ยังไม่แน่ใจ (ใกล้สุด ${(bestScore * 100).roundToInt()}%, รอง ${(nextScore * 100).roundToInt()}%) จึงไม่วงเพื่อเลี่ยงผิดช่อง")
         }
@@ -189,7 +199,11 @@ class ShapeMatcher {
         for (c in components) {
             val cx = (c.left + c.right) * 0.5f
             val cy = (c.top + c.bottom) * 0.5f
-            val near = abs(cx - leadCenterX) < width * 0.32f && abs(cy - leadCenterY) < height * 0.32f
+            // Retain detached lower tails (ญ/ฐ) using distance to the glyph, not ROI height.
+            val gapX = max(0, max(lead.left-c.right, c.left-lead.right))
+            val gapY = max(0, max(lead.top-c.bottom, c.top-lead.bottom))
+            val near = gapX <= max(3, ((lead.right-lead.left)*0.25f).toInt()) &&
+                gapY <= max(4f, (lead.bottom-lead.top)*0.48f)
             val keep = c === lead || (c.area >= max(2, lead.area / 90) && near && c.area < lead.area * 1.5f)
             if (!keep) continue
             for (i in 0 until c.length) selected[c.pixels[i]] = true
@@ -202,7 +216,7 @@ class ShapeMatcher {
         val aspect = actualGlyphWidth.toFloat() / actualGlyphHeight
         if (aspect < 0.17f || aspect > 5.8f) return null
 
-        val scale = 34f / max(actualGlyphWidth, actualGlyphHeight)
+        val scale = 56f / max(actualGlyphWidth, actualGlyphHeight)
         val scaledW = actualGlyphWidth * scale
         val scaledH = actualGlyphHeight * scale
         val offsetX = (SIZE - scaledW) / 2f
@@ -219,7 +233,7 @@ class ShapeMatcher {
             }
         }
         if (pixels < 15 || pixels > SIZE * SIZE * 0.7f) return null
-        return Glyph(bits, pixels, aspect)
+        return Glyph(bits, pixels, aspect, enclosedHoles(bits))
     }
 
     private fun midpointInSafeArea(c: Component, w: Int, h: Int): Boolean {
@@ -283,22 +297,52 @@ class ShapeMatcher {
         return bestThreshold
     }
 
-    private fun similarity(a: Glyph, b: Glyph): Float {
-        val aMask = a.bits
-        val bMask = b.bits
-        var exact = 0
-        var aClose = 0
-        var bClose = 0
-        for (i in aMask.indices) {
-            if (aMask[i] && bMask[i]) exact++
-            if (aMask[i] && withinOnePixel(bMask, i)) aClose++
-            if (bMask[i] && withinOnePixel(aMask, i)) bClose++
+    private fun enclosedHoles(bits: BooleanArray): BooleanArray {
+        val background = BooleanArray(bits.size) { !bits[it] }
+        val holes = BooleanArray(bits.size)
+        for (c in components(background, SIZE, SIZE)) {
+            if (c.left == 0 || c.top == 0 || c.right == SIZE-1 || c.bottom == SIZE-1 || c.area < 4) continue
+            for (j in 0 until c.length) holes[c.pixels[j]] = true
         }
-        val denom = (a.count + b.count).toFloat()
-        val strictDice = 2f * exact / denom
-        val softDice = (aClose + bClose).toFloat() / denom
-        val ratioPenalty = abs(kotlin.math.ln((a.aspect / b.aspect).toDouble())).toFloat() * 0.10f
-        return (strictDice * 0.52f + softDice * 0.48f - ratioPenalty).coerceIn(0f, 1f)
+        return holes
+    }
+
+    private fun similarity(a: Glyph, b: Glyph): Float {
+        // Small registration shifts tolerate subpixel resampling without making heads/tails interchangeable.
+        var best = 0f
+        for (dy in -1..1) for (dx in -1..1) {
+            var exact = 0; var nearA = 0; var nearB = 0
+            val countsA = IntArray(9); val countsB = IntArray(9); val common = IntArray(9)
+            var holesA = 0; var holesB = 0; var holesCommon = 0
+            for (y in 0 until SIZE) for (x in 0 until SIZE) {
+                val i = y*SIZE+x; val bx = x+dx; val by = y+dy
+                val j = if (bx in 0 until SIZE && by in 0 until SIZE) by*SIZE+bx else -1
+                val av = a.bits[i]; val bv = j >= 0 && b.bits[j]
+                val zone = min(2,y*3/SIZE)*3+min(2,x*3/SIZE)
+                if (av) countsA[zone]++
+                if (bv) countsB[zone]++
+                if (av && bv) { exact++; common[zone]++ }
+                if (av && j >= 0 && withinOnePixel(b.bits,j)) nearA++
+                if (bv && withinOnePixel(a.bits,i)) nearB++
+                val ah = a.holes[i]; val bh = j >= 0 && b.holes[j]
+                if (ah) holesA++
+                if (bh) holesB++
+                if (ah && bh) holesCommon++
+            }
+            val denom = (a.count+b.count).toFloat()
+            var local = 0f; var used = 0
+            for (zone in 0 until 9) {
+                val n = countsA[zone]+countsB[zone]
+                if (n < 6) continue
+                local += 2f*common[zone]/n; used++
+            }
+            val holeScore = if (holesA+holesB < 6) 1f else 2f*holesCommon/(holesA+holesB)
+            val score = 0.36f*(2f*exact/denom) + 0.30f*((nearA+nearB)/denom) +
+                0.24f*(if (used == 0) 0f else local/used) + 0.10f*holeScore
+            best = max(best,score)
+        }
+        val ratioPenalty = abs(kotlin.math.ln((a.aspect/b.aspect).toDouble())).toFloat()*0.16f
+        return (best-ratioPenalty).coerceIn(0f,1f)
     }
 
     private fun withinOnePixel(mask: BooleanArray, i: Int): Boolean {

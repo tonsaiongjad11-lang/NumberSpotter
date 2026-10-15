@@ -162,14 +162,14 @@ class CaptureService : Service() {
                 bitmap.copyPixelsFromBuffer(plane.buffer)
                 val cfg = RegionConfig.read(this)
                 val cropped = Bitmap.createBitmap(bitmap, 0, 0, fullWidth, fullHeight)
-                val small = Bitmap.createScaledBitmap(cropped, 480, (fullHeight*480f/fullWidth).toInt(), true)
+                val small = Bitmap.createScaledBitmap(cropped, 800, (fullHeight*800f/fullWidth).toInt(), true)
                 val reading = try { matcher.scan(small, small.width, small.height, cfg) }
                     finally { if (small !== cropped) small.recycle(); if (cropped !== bitmap) cropped.recycle() }
                 // Each frame stands on its own: never retain a previous target or wait for two frames.
                 val accepted = reading.match
                 CaptureState.message = reading.message
                 val scaledRect = accepted?.rect?.let {
-                    val scale = fullWidth/480f
+                    val scale = fullWidth/800f
                     android.graphics.Rect((it.left*scale).toInt(), (it.top*scale).toInt(),
                         (it.right*scale).toInt(), (it.bottom*scale).toInt())
                 }
