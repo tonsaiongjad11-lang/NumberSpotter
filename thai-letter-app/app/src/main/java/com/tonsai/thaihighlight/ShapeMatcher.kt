@@ -27,21 +27,59 @@ class ShapeMatcher {
     private data class Component(val pixels: IntArray, val length: Int, val area: Int,
                                  val left: Int, val top: Int, val right: Int, val bottom: Int)
 
+    private var detectedCells: List<Rect> = emptyList()
+    private var detectionAt = 0L
+
+    // Recognize the neutral grey rounded cards, independently of their letters.
+    private fun locateCards(bitmap: Bitmap): List<Rect> {
+        val w = bitmap.width; val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        val mask = BooleanArray(pixels.size) { i ->
+            val c = pixels[i]; val r = Color.red(c); val g = Color.green(c); val b = Color.blue(c)
+            r in 232..249 && abs(r-g) <= 4 && abs(g-b) <= 4
+        }
+        val cards = components(mask, w, h).filter {
+            val cw = it.right-it.left+1; val ch = it.bottom-it.top+1
+            cw in (w*0.10f).toInt()..(w*0.22f).toInt() &&
+                ch in (h*0.065f).toInt()..(h*0.18f).toInt() &&
+                it.top > h*0.20f && it.area > cw*ch*0.60f
+        }.map { Rect(it.left,it.top,it.right+1,it.bottom+1) }
+        if (cards.size !in 15..25 || cards.size % 5 != 0) return emptyList()
+        val sorted = cards.sortedBy { it.centerY() }.chunked(5).flatMap { row -> row.sortedBy { it.left } }
+        for (row in sorted.chunked(5)) {
+            if (row.maxOf { it.centerY() }-row.minOf { it.centerY() } > h*0.02f) return emptyList()
+        }
+        return sorted
+    }
+
     fun scan(bitmap: Bitmap, actualWidth: Int, actualHeight: Int, config: RegionConfig): Reading {
         val board = config.board.toPixels(actualWidth, actualHeight)
-        val cueRect = config.cue.toPixels(actualWidth, actualHeight)
+        val now = System.nanoTime()/1000000L
+        if (now-detectionAt > 400L) {
+            detectedCells = locateCards(bitmap)
+            detectionAt = now
+        }
+        val cells = detectedCells.ifEmpty { (0 until 20).map { cellRect(board,it/5,it%5) } }
+        val first = detectedCells.firstOrNull()
+        val cueRect = if (first != null) Rect(
+            (actualWidth*0.53f).toInt(),
+            (first.top-first.height()*0.70f).toInt().coerceAtLeast(0),
+            (actualWidth*0.95f).toInt(),
+            (first.top-first.height()*0.16f).toInt().coerceAtLeast(1)
+        ) else config.cue.toPixels(actualWidth, actualHeight)
         if (board.width() < 30 || board.height() < 30) return Reading(null, "กรอบตารางเล็กเกินไป")
-        val cue = extract(bitmap, cueRect, preferOrange = true)
-            ?: return Reading(null, "ไม่พบตัวสีส้ม: ปรับกรอบม่วงให้พอดีกับอักษรเป้าหมาย")
+        val cue = extract(bitmap, cueRect, preferOrange = false)
+            ?: return Reading(null, "ไม่พบอักษรเป้าหมายในช่องขวามือ")
 
         var bestScore = -1f
         var nextScore = -1f
         var bestRow = -1
         var bestCol = -1
         var bestRect: Rect? = null
-        for (row in 0 until 5) {
+        for (row in 0 until cells.size / 5) {
             for (col in 0 until 5) {
-                val rect = cellRect(board, row, col)
+                val rect = cells[row*5+col]
                 // Stay clear of colored grid borders and of the thin overlay outline.
                 val inner = insetByFraction(rect, 0.15f)
                 val item = extract(bitmap, inner, preferOrange = false) ?: continue
@@ -57,7 +95,7 @@ class ShapeMatcher {
                 }
             }
         }
-        if (bestRect == null) return Reading(null, "ไม่พบรูปทรงอักษรใน 25 ช่อง: ตรวจกรอบตาราง")
+        if (bestRect == null) return Reading(null, "ไม่พบรูปทรงอักษรใน ช่องตาราง: ตรวจกรอบตาราง")
         val confidenceOk = bestScore >= config.cutoff
         val separationOk = bestScore - nextScore >= config.minGap
         if (!confidenceOk || !separationOk) {
@@ -71,9 +109,9 @@ class ShapeMatcher {
 
     fun cellRect(board: Rect, row: Int, col: Int) = Rect(
         board.left + (board.width().toFloat() * col / 5).roundToInt(),
-        board.top + (board.height().toFloat() * row / 5).roundToInt(),
+        board.top + (board.height().toFloat() * row / 4).roundToInt(),
         board.left + (board.width().toFloat() * (col + 1) / 5).roundToInt(),
-        board.top + (board.height().toFloat() * (row + 1) / 5).roundToInt()
+        board.top + (board.height().toFloat() * (row + 1) / 4).roundToInt()
     )
 
     private fun insetByFraction(rect: Rect, f: Float): Rect {

@@ -16,15 +16,15 @@ data class PercentRegion(val left: Float, val top: Float, val right: Float, val 
 }
 
 data class RegionConfig(
-    val board: PercentRegion = PercentRegion(4f, 28f, 96f, 86f),
-    val cue: PercentRegion = PercentRegion(68f, 8f, 98f, 23f),
+    val board: PercentRegion = PercentRegion(4f, 35.3f, 96f, 84.1f),
+    val cue: PercentRegion = PercentRegion(53f, 27f, 95f, 33.5f),
     val cutoff: Float = 0.61f,
     val minGap: Float = 0.028f,
-    val showGuides: Boolean = true
+    val showGuides: Boolean = false
 ) {
     companion object {
         fun read(context: Context): RegionConfig {
-            val p = context.getSharedPreferences("regions", Context.MODE_PRIVATE)
+            val p = context.getSharedPreferences("regions_v2", Context.MODE_PRIVATE)
             fun reg(prefix: String, default: PercentRegion) = PercentRegion(
                 p.getFloat("${prefix}L", default.left),
                 p.getFloat("${prefix}T", default.top),
@@ -32,16 +32,16 @@ data class RegionConfig(
                 p.getFloat("${prefix}B", default.bottom)
             )
             return RegionConfig(
-                board = reg("board", PercentRegion(4f, 28f, 96f, 86f)),
-                cue = reg("cue", PercentRegion(68f, 8f, 98f, 23f)),
+                board = reg("board", PercentRegion(4f, 35.3f, 96f, 84.1f)),
+                cue = reg("cue", PercentRegion(53f, 27f, 95f, 33.5f)),
                 cutoff = p.getFloat("cutoff", 0.61f),
                 minGap = p.getFloat("minGap", 0.028f),
-                showGuides = p.getBoolean("guides", true)
+                showGuides = p.getBoolean("guides", false)
             )
         }
     }
     fun save(context: Context) {
-        val p = context.getSharedPreferences("regions", Context.MODE_PRIVATE).edit()
+        val p = context.getSharedPreferences("regions_v2", Context.MODE_PRIVATE).edit()
         fun saveReg(prefix: String, r: PercentRegion) {
             p.putFloat("${prefix}L", r.left)
             p.putFloat("${prefix}T", r.top)

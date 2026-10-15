@@ -66,8 +66,8 @@ class MainActivity : Activity() {
                 setPadding(0, 0, 0, dp(12))
             })
         }
-        title("ตัวช่วยจับพยัญชนะ ก–ฮ", 24f)
-        info("ดูตัวอักษรเป้าหมายสีส้ม → เทียบกับ 25 ช่องใหม่ทุกภาพ → วงสีเขียวให้กดเอง ไม่แตะอัตโนมัติ และไม่จำตำแหน่งเดิม")
+        title("จับพยัญชนะ ก–ฮ • เรียลไทม์ v2", 24f)
+        info("ตรวจช่องตารางอัตโนมัติ • ดูตัวอักษรในช่องขวามือ → เทียบกับ 20 ช่องใหม่ทุกภาพ → วงสีเขียวให้กดเอง ไม่แตะอัตโนมัติ และไม่จำตำแหน่งเดิม")
         status = TextView(this).apply {
             textSize = 15f
             setTextColor(Color.rgb(18, 67, 44))
@@ -102,8 +102,8 @@ class MainActivity : Activity() {
             root.addView(row1)
             root.addView(row2)
         }
-        section("1. กรอบตาราง 5×5", "ปรับให้ครอบขอบนอกของตารางทั้ง 25 ช่อง", "board", cfg.board)
-        section("2. กรอบอักษรสีส้ม", "ปรับให้ครอบเฉพาะพยัญชนะเป้าหมาย (ไม่รวมคะแนน/นาฬิกา)", "cue", cfg.cue)
+        section("1. กรอบตาราง 5×4", "ปรับให้ครอบขอบนอกของตารางทั้ง 20 ช่อง", "board", cfg.board)
+        section("2. กรอบเป้าหมายขวามือ", "ปรับให้ครอบเฉพาะพยัญชนะเป้าหมาย (ไม่รวมคะแนน/นาฬิกา)", "cue", cfg.cue)
         title("3. ความมั่นใจขั้นต่ำ", 17f)
         info("เพิ่มค่าเพื่อลดโอกาสวงผิด หรือปรับลดเล็กน้อยหากวงไม่ขึ้น")
         val threshold = EditText(this).apply {
@@ -114,7 +114,7 @@ class MainActivity : Activity() {
         }
         root.addView(threshold)
         guideCheck = CheckBox(this).apply {
-            text = "แสดงกรอบตัวช่วยปรับตำแหน่ง (ฟ้า = ตาราง / ม่วง = ตัวสีส้ม)"
+            text = "แสดงกรอบตัวช่วยปรับตำแหน่ง (ฟ้า = ตาราง / ม่วง = ตัวเป้าหมาย)"
             isChecked = cfg.showGuides
             textSize = 13f
         }
@@ -174,7 +174,7 @@ class MainActivity : Activity() {
             val stop = Intent(this, CaptureService::class.java).apply { action = CaptureService.ACTION_STOP }
             startService(stop)
         }
-        info("ระหว่างเกมจะเห็นกรอบเขียวบนช่องที่เหมือนตัวสีส้ม เปิดสิทธิ์จับหน้าจอทุกครั้งที่เริ่มใหม่ บางเกมบล็อกภาพหน้าจอ (จอดำ) จึงไม่สามารถอ่านได้")
+        info("ระหว่างเกมจะเห็นกรอบเขียวบนช่องที่เหมือนตัวเป้าหมาย เปิดสิทธิ์จับหน้าจอทุกครั้งที่เริ่มใหม่ บางเกมบล็อกภาพหน้าจอ (จอดำ) จึงไม่สามารถอ่านได้")
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {

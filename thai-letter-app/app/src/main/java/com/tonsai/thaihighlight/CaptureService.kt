@@ -146,7 +146,7 @@ class CaptureService : Service() {
         val img = try { source.acquireLatestImage() } catch (_: Exception) { null } ?: return
         try {
             val now = SystemClock.uptimeMillis()
-            if (closing.get() || now - frameAt < 65L) return
+            if (closing.get() || now - frameAt < 30L) return
             frameAt = now
             val plane = img.planes.firstOrNull() ?: return
             val stride = plane.pixelStride
@@ -161,26 +161,22 @@ class CaptureService : Service() {
                 plane.buffer.rewind()
                 bitmap.copyPixelsFromBuffer(plane.buffer)
                 val cfg = RegionConfig.read(this)
-                val reading = matcher.scan(bitmap, fullWidth, fullHeight, cfg)
-                val cellIndex = reading.match?.let { it.row * 5 + it.col } ?: -1
-                if (cellIndex == -1) {
-                    lastGoodCell = -1
-                    repeatedCell = 0
-                } else {
-                    repeatedCell = if (cellIndex == lastGoodCell) repeatedCell + 1 else 1
-                    lastGoodCell = cellIndex
+                val cropped = Bitmap.createBitmap(bitmap, 0, 0, fullWidth, fullHeight)
+                val small = Bitmap.createScaledBitmap(cropped, 480, (fullHeight*480f/fullWidth).toInt(), true)
+                val reading = try { matcher.scan(small, small.width, small.height, cfg) }
+                    finally { if (small !== cropped) small.recycle(); if (cropped !== bitmap) cropped.recycle() }
+                // Each frame stands on its own: never retain a previous target or wait for two frames.
+                val accepted = reading.match
+                CaptureState.message = reading.message
+                val scaledRect = accepted?.rect?.let {
+                    val scale = fullWidth/480f
+                    android.graphics.Rect((it.left*scale).toInt(), (it.top*scale).toInt(),
+                        (it.right*scale).toInt(), (it.bottom*scale).toInt())
                 }
-                // Strong match responds at once; normal match must hold for two frames.
-                val accepted = reading.match?.takeIf {
-                    repeatedCell >= 2 ||
-                        (it.score >= 0.88f && it.score - it.secondScore >= 0.10f)
-                }
-                CaptureState.message = reading.message +
-                    if (reading.match != null && accepted == null) " • ตรวจอีกภาพเพื่อยืนยัน" else ""
                 val board = cfg.board.toPixels(fullWidth, fullHeight)
                 val cue = cfg.cue.toPixels(fullWidth, fullHeight)
                 main.post {
-                    if (!closing.get()) overlay?.update(accepted?.rect, board, cue, cfg.showGuides)
+                    if (!closing.get()) overlay?.update(scaledRect, board, cue, cfg.showGuides)
                 }
             } finally {
                 bitmap.recycle()
@@ -208,7 +204,7 @@ class CaptureService : Service() {
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setContentTitle("กำลังจับตัวอักษร ก–ฮ")
-            .setContentText("เทียบตัวส้มกับตาราง 25 ช่อง • แตะเพื่อเปิดการตั้งค่า")
+            .setContentText("เทียบตัวส้มกับตาราง 20 ช่อง • แตะเพื่อเปิดการตั้งค่า")
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(
